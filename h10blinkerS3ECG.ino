@@ -7,32 +7,27 @@
 
 Adafruit_NeoPixel pixel(NEOPIXEL_NUM, NEOPIXEL_PIN, NEO_GRBW + NEO_KHZ800);
 
-
-// ------- 动态获取 PMD Service 和 ECG 特征值 UUID -------
 #define PMD_SERVICE_UUID "FB005C80-02E7-F387-1CAD-8ACD2D8DF0C8"
 #define PMD_CONTROL_CHAR_UUID "FB005C81-02E7-F387-1CAD-8ACD2D8DF0C8"
 #define PMD_DATA_CHAR_UUID "FB005C82-02E7-F387-1CAD-8ACD2D8DF0C8"
-//String pmdServiceUUID = "FB005C80-02E7-F387-1CAD-8ACD2D8DF0C8";
-//String controlCharUUID = "FB005C81-02E7-F387-1CAD-8ACD2D8DF0C8";
-//String dataCharUUID = "FB005C82-02E7-F387-1CAD-8ACD2D8DF0C8";
 
-
-NimBLEAdvertisedDevice* hrBand = nullptr;
 NimBLEClient* hrclient = nullptr;
 NimBLERemoteCharacteristic* controlChar = nullptr;
 NimBLERemoteCharacteristic* dataChar = nullptr;
 
-// ECG 滑动窗口, 存储5帧, 每帧最多30个样本
 #define MAX_FRAME_HISTORY 5
-std::vector<int32_t> ecg_history[MAX_FRAME_HISTORY];  // 5帧
-int frame_idx = 0;                                    // 最新帧写入下标
-
-// --- 单独存储正在播放的帧&样本索引 ---
+std::vector<int32_t> ecg_history[MAX_FRAME_HISTORY];
+int frame_idx = 0;
 std::vector<int32_t> ecg_show_frame;
 int ecg_show_index = 0;
 unsigned long last_show_time = 0;
 
-// --------- ECG数据解析 ---------
+static const uint8_t START_ECG_CMD[] = { 0x02, 0x00, 0x00, 0x01, 0x82, 0x00, 0x01, 0x01, 0x0E, 0x00 };
+
+unsigned long last_ecg_data_time = 0;
+unsigned long last_ble_try_time = 0;
+bool ble_connected = false;
+
 void handle_ecg_frame(const uint8_t* pData, size_t len) {
   if (len < 10) return;
   if (pData[0] != 0x00 || pData[9] != 0x00) return;
@@ -43,123 +38,115 @@ void handle_ecg_frame(const uint8_t* pData, size_t len) {
     if (ecg & 0x800000) ecg |= 0xFF000000;
     ecg_history[frame_idx].push_back(ecg);
   }
-  // 新帧就绪时，准备显示用帧内容（线程安全的场合建议锁）
   ecg_show_frame = ecg_history[frame_idx];
   ecg_show_index = 0;
   frame_idx = (frame_idx + 1) % MAX_FRAME_HISTORY;
+  last_ecg_data_time = millis();
 }
 
-// --------- BLE通知回调 ---------
 void notifyCallback(NimBLERemoteCharacteristic* pChr, uint8_t* pData, size_t len, bool isNotify) {
   handle_ecg_frame(pData, len);
 }
 
+void disconnect_ble() {
+  if (hrclient) {
+    if (hrclient->isConnected()) hrclient->disconnect();
+    hrclient = nullptr; // 只是清空指针，不 delete
+  }
+  controlChar = nullptr;
+  dataChar = nullptr;
+  ble_connected = false;
+}
 
-// --------- 启动ECG数据流命令 ---------
-static const uint8_t START_ECG_CMD[] = { 0x02, 0x00, 0x00, 0x01, 0x82, 0x00, 0x01, 0x01, 0x0E, 0x00 };
+bool try_connect_ble() {
+  disconnect_ble();
+  NimBLEScan* scan = NimBLEDevice::getScan();
+  NimBLEScanResults results = scan->getResults(3000);
+  NimBLEUUID serviceUuid(HR_SERVICE_UUID);
+
+  for (int i = 0; i < results.getCount(); i++) {
+    const NimBLEAdvertisedDevice* device = results.getDevice(i);
+    if (device->isAdvertisingService(serviceUuid)) {
+      hrclient = NimBLEDevice::createClient();
+      if (!hrclient->connect(device)) {
+        disconnect_ble();
+        continue;
+      }
+      NimBLERemoteService* service = hrclient->getService(PMD_SERVICE_UUID);
+      if (!service) { disconnect_ble(); continue; }
+      controlChar = service->getCharacteristic(PMD_CONTROL_CHAR_UUID);
+      dataChar = service->getCharacteristic(PMD_DATA_CHAR_UUID);
+      if (!controlChar || !dataChar) { disconnect_ble(); continue; }
+      if (!dataChar->subscribe(true, notifyCallback)) { disconnect_ble(); continue; }
+      if (!controlChar->writeValue(START_ECG_CMD, sizeof(START_ECG_CMD), false)) { disconnect_ble(); continue; }
+      ble_connected = true;
+      last_ecg_data_time = millis();
+      return true;
+    }
+  }
+  disconnect_ble();
+  return false;
+}
 
 void setup() {
-  //Serial.begin(115200);
-  //Serial.println("Setup started");
-
   pixel.begin();
-  //Serial.println("pixelbegin finished");
   pixel.show();
-  //Serial.println("pixelshow finished");
-  pixel.setBrightness(0);  // 初始灭灯
-  //Serial.println("pixelbrightness finished");
-
-  //Serial.println("Pixel init finished");
-
-
+  pixel.setBrightness(0);
   NimBLEDevice::init("");
-  //Serial.println("NimBLE init finished");
-  NimBLEScan* scan = NimBLEDevice::getScan();
-  //Serial.println("Scan init finished");
-  NimBLEScanResults results = scan->getResults(10 * 1000);
-  //Serial.println("Scan finished");
-  //scan->setAdvertisedDeviceCallbacks(new MyAdvertisedDeviceCallbacks());
-  //scan->setActiveScan(true);
-  //scan->start(5, false);
-  NimBLEUUID serviceUuid("180D");
-  for (int i = 0; i < results.getCount(); i++) {
-      const NimBLEAdvertisedDevice *device = results.getDevice(i);
-      
-      if (device->isAdvertisingService(serviceUuid)) {
-          // create a client and connect
-          //hrBand = device; //won't work because const
-          
-          hrclient = NimBLEDevice::createClient();
-          if (!hrclient->connect(device)) {
-            //Serial.println("BLE Connect fail");
-            return;
-          }
-          //  if (!findPMDService(client)) {
-          //    Serial.println("Cannot find PMD service/char");
-          //    return;
-          //  }
-          //Serial.printf("Found PMD Service:%s, Control:%s, Data:%s\n",
-          //              pmdServiceUUID.c_str(), controlCharUUID.c_str(), dataCharUUID.c_str());
-          NimBLERemoteService* service = hrclient->getService(PMD_SERVICE_UUID);
-          //Serial.println("Get service passed");
-          if (!service) return;
-          //Serial.println("Service not null");
-          controlChar = service->getCharacteristic(PMD_CONTROL_CHAR_UUID);
-          //Serial.println("Get CONTROL passed");
-          dataChar = service->getCharacteristic(PMD_DATA_CHAR_UUID);
-          //Serial.println("Get DATA passed");
-          if (!controlChar || !dataChar) return;
-          if (!dataChar->subscribe(true, notifyCallback)) {
-            //Serial.println("Subscribe failed");
-            return;
-          }
-          //Serial.println("Subscribed");
-          // 启动ECG流
-          controlChar->writeValue(START_ECG_CMD, sizeof(START_ECG_CMD), false);
-          //Serial.println("Start ECG collection");
-      }
-  }
-  //Serial.println("Setup finished");
-  // 等待找到设备
-  //while (!hrBand) delay(100);
-  
+  try_connect_ble();
+  last_ble_try_time = millis();
 }
 
 void loop() {
   unsigned long now = millis();
-  // 每7ms切换显示下一个样本
+
+  if (!ble_connected || (now - last_ecg_data_time > 2000)) {
+    if (now - last_ble_try_time > 3000) {
+      try_connect_ble();
+      last_ble_try_time = now;
+    }
+  }
+
+  if (!ble_connected) {
+    pixel.setBrightness(0);
+    pixel.show();
+    delay(5);
+    return;
+  }
+
   if (!ecg_show_frame.empty() && (now - last_show_time >= 7)) {
-    // 获取滑动窗口内（5帧）所有样本用于min-max归一化
     int32_t vmin = INT32_MAX, vmax = INT32_MIN;
-    int64_t vsum = 0;
-    int vcount = 0;
-    for (int i = 0; i < MAX_FRAME_HISTORY; ++i)
+    std::vector<int32_t> samples;
+    for (int i = 0; i < MAX_FRAME_HISTORY; ++i) {
       for (auto v : ecg_history[i]) {
         if (v < vmin) vmin = v;
         if (v > vmax) vmax = v;
-        vsum += v;
-        vcount++;
+        samples.push_back(v);
       }
-    float vaverage = vcount > 0 ? static_cast<float>(vsum) / vcount : 0.0;
+    }
+    float vmedian = 0.0f;
+    if (!samples.empty()) {
+      std::sort(samples.begin(), samples.end());
+      size_t n = samples.size();
+      vmedian = (n % 2 == 1) ? static_cast<float>(samples[n / 2]) : 0.5f * (samples[n / 2 - 1] + samples[n / 2]);
+    }
     int32_t vcur = ecg_show_frame[ecg_show_index];
     float ratio = 0.5;
-    if (vmax > vmin) ratio = float(vcur - vaverage) / (vmax - vmin) + 0.1;
-    // 亮度和色彩映射
-    if (ratio<0) ratio = 0.0;
+    if (vmax > vmin) ratio = 2.0f * float(vcur - vmedian) / (vmax - vmin);
+    if (ratio < 0) ratio = 0.0;
     int brightness = 0 + ratio * 225;
     uint32_t color = pixel.Color(255, 0, 0);
     pixel.setBrightness(brightness);
     pixel.setPixelColor(0, color);
     pixel.show();
     ecg_show_index++;
-    if (ecg_show_index >= ecg_show_frame.size()) ecg_show_index = 0;  // 一帧播完，从头循环
+    if (ecg_show_index >= ecg_show_frame.size()) ecg_show_index = 0;
     last_show_time = now;
   }
-  // 若无数据，保持黑灯
+
   if (ecg_show_frame.empty()) {
-    //pixel.setBrightness(0);
-    //pixel.show();
+    pixel.setBrightness(0);
+    pixel.show();
     delay(5);
   }
-  
 }
